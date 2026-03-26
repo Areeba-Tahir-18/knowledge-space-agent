@@ -4,26 +4,10 @@ import json
 import requests
 import asyncio
 import aiohttp
-from typing import Dict, Optional, Set, Union, List, Any, Iterable
-import re
-from urllib.parse import urlparse
+from typing import List
 from difflib import SequenceMatcher
-
-
-
-def normalize_title(title: str) -> str:
-    """
-    Normalize a dataset title for better fuzzy matching:
-    - Lowercase
-    - Remove punctuation
-    - Remove extra spaces
-    """
-    if not title:
-        return ""
-    title = title.lower()
-    title = re.sub(r"[^\w\s]", "", title)  # remove punctuation
-    title = re.sub(r"\s+", " ", title).strip()  # normalize spaces
-    return title
+from urllib.parse import urlparse, urlunparse
+import re
 
 
 def tool(args_schema):
@@ -336,6 +320,9 @@ async def general_search_async(query: str, top_k: int = 10, enrich_details: bool
                 or item.get("dc", {}).get("identifier")
                 or "https://knowledge-space.org"
             )
+      
+      
+      
             normalized_results.append(
                 {
                     "_id": f"general_{i}",
@@ -377,16 +364,16 @@ def general_search(query: str, top_k: int = 10, enrich_details: bool = True) -> 
                 or "https://knowledge-space.org"
             )
             normalized_results.append(
-    {
-        "_id": item.get("id") or item.get("_id") or url,
-        "_source": item,
-        "_score": 1.0,
-        "title_guess": title,
-        "content": description,
-        "primary_link": url,
-        "metadata": item,
-    }
-)
+                {
+                    "id": item.get("id", f"ks{i}"),
+                    "_source": item,
+                    "_score": 1.0,
+                    "title_guess": title,
+                    "content": description,
+                    "primary_link": url,
+                    "metadata": item,
+                }
+            )
         print(f"  -> General search returned {len(normalized_results)} results")
         if enrich_details and normalized_results:
             print("  -> Enriching results with detailed dataset information (parallel)...")
@@ -461,28 +448,40 @@ def _perform_search(data_source_id: str, query: str, filters: dict, all_configs:
         return []
     
     
-# Duplicate Removal Feature 
 
-from typing import List
-from difflib import SequenceMatcher
-from urllib.parse import urlparse, urlunparse
-import re
-
+ # Deduplication feature updated version 
 def normalize_url(url: str) -> str:
     """Normalize URLs by stripping query params and fragments."""
+    if not url:
+        return ""
     parsed = urlparse(url)
     normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
     return normalized.lower().rstrip("/")
 
+
 def normalize_title(title: str) -> str:
     """Normalize title: lowercase, strip punctuation, extra spaces."""
+    if not title:
+        return ""
     title = title.lower()
     title = re.sub(r"[^\w\s]", "", title)
     title = re.sub(r"\s+", " ", title)
     return title.strip()
 
+
+def titles_reordered_match(t1: str, t2: str) -> bool:
+    """Detect titles with same words but different order."""
+    tokens1 = set(t1.split())
+    tokens2 = set(t2.split())
+    return tokens1 == tokens2
+
+
 def deduplicate_datasets(all_datasets: List[dict]) -> List[dict]:
-    """Deduplicate datasets using canonical ID, normalized URL, and fuzzy title."""
+    """Deduplicate datasets using canonical ID, normalized URL, fuzzy title, and reordered title detection."""
+
+    if not all_datasets:
+        return []
+
     cleaned = []
     seen_canonical = set()
     seen_urls = set()
@@ -490,84 +489,83 @@ def deduplicate_datasets(all_datasets: List[dict]) -> List[dict]:
     for dataset in all_datasets:
         metadata = dataset.get("metadata", {}) or dataset.get("_source", {})
 
-        # Canonical identity
+        # Canonical ID
         dataset_id = metadata.get("id") or metadata.get("dataset_id") or dataset.get("_id")
-        datasource_id = dataset.get("datasource_id") or "default_source"
+        dataset_id = str(dataset_id).lower() if dataset_id else ""
+
+        datasource_id = str(dataset.get("datasource_id") or "default_source").lower()
         canonical_key = f"{datasource_id}:{dataset_id}"
 
-        if canonical_key in seen_canonical:
+        if dataset_id and canonical_key in seen_canonical:
             continue
-        seen_canonical.add(canonical_key)
+
+        if dataset_id:
+            seen_canonical.add(canonical_key)
 
         # URL deduplication
         raw_url = dataset.get("primary_link", "")
         normalized_url = normalize_url(raw_url)
+
         if normalized_url and normalized_url in seen_urls:
             continue
+
         if normalized_url:
             seen_urls.add(normalized_url)
 
         # Title normalization
         title = normalize_title(
-            dataset.get("title") or dataset.get("title_guess") or metadata.get("title") or ""
+            dataset.get("title")
+            or dataset.get("title_guess")
+            or metadata.get("title")
+            or ""
         )
 
-        # Fuzzy title deduplication
         duplicate_found = False
-        for existing in cleaned:
-            existing_title = normalize_title(
-                existing.get("title") or existing.get("title_guess") or ""
-            )
-            similarity = SequenceMatcher(None, title, existing_title).ratio()
-            if similarity > 0.93:
-                duplicate_found = True
-                break
+
+        if title:
+            for existing in cleaned:
+                existing_title = normalize_title(
+                    existing.get("title")
+                    or existing.get("title_guess")
+                    or ""
+                )
+
+                if not existing_title:
+                    continue
+
+                # Fuzzy match
+                similarity = SequenceMatcher(None, title, existing_title).ratio()
+
+                if similarity > 0.93:
+                    duplicate_found = True
+                    break
+
+                # Reordered title match
+                if titles_reordered_match(title, existing_title):
+                    duplicate_found = True
+                    break
 
         if not duplicate_found:
             cleaned.append(dataset)
 
     return cleaned
 
-
-# ks_search_tool.py
-
+    
 @tool(args_schema=BaseModel)
 def smart_knowledge_search(
-    
-    
     query: Optional[str] = None,
     filters: Optional[Union[Dict, Set]] = None,
     data_source: Optional[str] = None,
     top_k: int = 10,
 ) -> dict:
     q = query or "*"
-    
-    try:
-        if filters:
-            # if filters are provided, use _perform_search if possible
-            config_path = "datasources_config.json"
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as fh:
-                    all_configs = json.load(fh)
-                target_id = DATASOURCE_NAME_TO_ID.get(data_source) or (
-                    data_source if data_source in all_configs else None
-                )
-                if target_id:
-                    results = _perform_search(target_id, q, dict(filters), all_configs)
-                    results = deduplicate_datasets(results)
-                    return {"combined_results": results[:top_k]}
-        
-        # fallback to general_search if no filters or target_id
-        results = general_search(q, top_k*2, enrich_details=True).get("combined_results", [])
-        results = deduplicate_datasets(results)
-        return {"combined_results": results[:top_k]}
-
-    except Exception as e:
-        print(f"Error in smart_knowledge_search: {e}")
-        return {"combined_results": []}
-    
-    
-    
-    
-    
-    
+    if filters:
+        config_path = "datasources_config.json"
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as fh:
+                all_configs = json.load(fh)
+            target_id = DATASOURCE_NAME_TO_ID.get(data_source) or (data_source if data_source in all_configs else None)
+            if target_id:
+                results = _perform_search(target_id, q, dict(filters), all_configs)
+                return {"combined_results": results[:top_k]}
+    return general_search(q, top_k, enrich_details=True)
